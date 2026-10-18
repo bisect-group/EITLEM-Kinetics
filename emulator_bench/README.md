@@ -26,7 +26,8 @@ See `REPORT.md` for sources and details.
 
 - `cache_embeddings.py`: builds the ESM1v and fingerprint caches for all splits.
 - `train_single_target_tvt.py`: trains one split and one seed.
-- `run_split_benchmarks.py`: caches features, then trains every task, split and seed. `--gpus 0 1 --runs_per_gpu 2` runs several trainings at once, one GPU each. `--amp` turns on mixed precision.
+- `run_split_benchmarks.py`: caches features, then trains every task, split and seed. `--gpus 0 1` runs one training per GPU. `--runs_per_gpu` defaults to 1. Two runs on one A10 (24 GB) risk out-of-memory: one run peaked near 19 GB, and long-sequence batches can raise it. The training script sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (if unset), which cut the peak to about 15 GB on a test subset. `--amp` turns on mixed precision.
+  `--num_workers` (default 8) sets the threads that build batches. `--prefetch_factor` (default 2) sets how many batches they build ahead. Each batch in flight holds GPU memory.
 - `aggregate_eitlem_results.py`: mean and std over seeds.
 - `predict_single_target.py`: inference from a saved `lastmodel.pth`.
 
@@ -38,9 +39,12 @@ See `commands.txt` in the parent folder for the exact commands. Run them from `b
 
 ## Output layout
 
-- `embeddings/proteins_v2/`, `embeddings/ligands_v2/`, `embeddings/manifest.json`: feature cache.
+- `embeddings/proteins_v3/`, `embeddings/ligands_v3/`, `embeddings/manifest.json`: feature cache.
+  `proteins_v3/shard_<n>.npy` is one uncompressed float32 array with the residues of many proteins. `shard_<n>.json` maps each protein key to `[offset, length]`.
+  Training reads the shards with `np.load(mmap_mode="r")`, so all runs share the OS page cache.
+  A shard holds about 1M residues (5 GB). The shard `.json` is written last, so an interrupted build resumes and skips finished shards.
   Protein keys cover the ESM model, layer, dtype, window size and stride. Ligand keys cover fingerprint type, radius and bits.
-  Change `CACHE_VERSION` in `common.py` to force a rebuild.
+  Change `CACHE_VERSION` in `common.py` to force a rebuild. Caches from version 2 (`proteins_v2/`, one `.npz` per protein) are not read. Rebuild once and delete the old folders.
 - `<task>/<split_group>/<split_name>/seed_<n>/`: `lastmodel.pth`, `logfile.csv`, `final_results_{train,val,test}.csv`,
   `pred_label_{train,val,test}.csv`, `run_summary.json`. `<split_name>` is `all` for flat split groups.
 - `aggregate_eitlem_results.csv`: mean and std over seeds.

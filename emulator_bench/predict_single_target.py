@@ -13,10 +13,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from emulator_bench.common import DEFAULT_OUTPUT_ROOT, read_table, regression_metrics, require_columns, save_json
-from emulator_bench.dataset import CachedEitlemDataset, EitlemDataLoader
+from emulator_bench.dataset import EitlemDataLoader
 from emulator_bench.feature_pipeline import LigandEmbeddingStore, ProteinEmbeddingStore
 from emulator_bench.modeling import build_model
-from emulator_bench.train_single_target_tvt import _prepare_batch
 
 
 def main():
@@ -30,10 +29,8 @@ def main():
     parser.add_argument("--target_col", type=str, default="log10_value")
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--prefetch_factor", type=int, default=4)
-    parser.add_argument("--pin_memory", action="store_true")
-    parser.add_argument("--protein_cache_items", type=int, default=512)
+    parser.add_argument("--num_workers", type=int, default=4, help="Threads that build batches.")
+    parser.add_argument("--prefetch_factor", type=int, default=2, help="Batches built ahead.")
     parser.add_argument("--lazy_ligands", action="store_true")
     args = parser.parse_args()
 
@@ -43,10 +40,7 @@ def main():
 
     frame = read_table(Path(args.input_path))
     require_columns(frame, [args.sequence_col, args.smiles_col], Path(args.input_path))
-    protein_store = ProteinEmbeddingStore(
-        Path(args.embeddings_dir),
-        max_items=args.protein_cache_items,
-    )
+    protein_store = ProteinEmbeddingStore(Path(args.embeddings_dir))
     ligand_store = LigandEmbeddingStore(
         Path(args.embeddings_dir),
         mol_type=train_args["mol_type"],
@@ -55,16 +49,18 @@ def main():
         smiles_values=frame[args.smiles_col].astype(str).tolist(),
         preload=not args.lazy_ligands,
     )
-    dataset = CachedEitlemDataset(frame, protein_store, ligand_store, args.sequence_col, args.smiles_col, args.target_col)
-    loader_kwargs = {
-        "batch_size": args.batch_size,
-        "num_workers": args.num_workers,
-        "pin_memory": args.pin_memory or device.type == "cuda",
-        "shuffle": False,
-    }
-    if args.num_workers > 0:
-        loader_kwargs["prefetch_factor"] = args.prefetch_factor
-    loader = EitlemDataLoader(dataset, **loader_kwargs)
+    loader = EitlemDataLoader(
+        frame,
+        protein_store,
+        ligand_store,
+        device,
+        args.batch_size,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        sequence_col=args.sequence_col,
+        smiles_col=args.smiles_col,
+        target_col=args.target_col,
+    )
 
     model = build_model(
         predictor_type=train_args["predictor_type"],
@@ -83,10 +79,9 @@ def main():
     truths = []
     with torch.no_grad():
         for batch in loader:
-            batch = _prepare_batch(batch, device)
             prediction = model(batch)
             preds.append(prediction.detach().cpu().float())
-            if hasattr(batch, "value"):
+            if batch.value is not None:
                 truths.append(batch.value.detach().cpu().float())
 
     pred_np = torch.cat(preds).numpy() if preds else np.array([], dtype=np.float32)

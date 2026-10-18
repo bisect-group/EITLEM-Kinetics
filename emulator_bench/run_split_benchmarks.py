@@ -51,7 +51,8 @@ def main():
     parser.add_argument("--skip_cache", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--epochs", type=int, default=100, help="Original value is 100. Change it only for smoke tests.")
-    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--num_workers", type=int, default=8, help="Batch-building threads per run.")
+    parser.add_argument("--prefetch_factor", type=int, default=2, help="Batches built ahead per run. Each one holds GPU memory.")
     args = parser.parse_args()
 
     data_root = Path(args.data_root)
@@ -113,6 +114,8 @@ def main():
             run_device,
             "--num_workers",
             str(args.num_workers),
+            "--prefetch_factor",
+            str(args.prefetch_factor),
             "--seed",
             str(seed),
         ]

@@ -32,7 +32,7 @@ DEFAULT_SPLIT_GROUPS = [
 ]
 DEFAULT_SEEDS = [666, 777, 888]
 TASKS = ("kcat", "km")
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 ESM_MODEL = "esm1v_t33_650M_UR90S_1"
 ESM_LAYER = 33
 PROTEIN_DTYPE = "float32"
@@ -58,9 +58,9 @@ def ligand_cache_key(smiles: str, mol_type: str, radius: int, nbits: int) -> str
     return stable_hash(raw)
 
 
-def protein_cache_path(embeddings_dir: Path, sequence: str) -> Path:
-    key = protein_cache_key(sequence)
-    return Path(embeddings_dir) / f"proteins_v{CACHE_VERSION}" / key[:2] / f"{key}.npz"
+def protein_cache_dir(embeddings_dir: Path) -> Path:
+    """Holds `shard_<n>.npy` (all residues of its proteins, float32) and `shard_<n>.json` (key -> [offset, length])."""
+    return Path(embeddings_dir) / f"proteins_v{CACHE_VERSION}"
 
 
 def ligand_cache_path(embeddings_dir: Path, smiles: str, mol_type: str, radius: int, nbits: int) -> Path:

@@ -5,6 +5,9 @@ import sys
 import time
 from pathlib import Path
 
+# Batches live in a side-stream allocator pool; expandable segments stop it from fragmenting GPU memory.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import numpy as np
 import pandas as pd
 import torch
@@ -23,22 +26,13 @@ from emulator_bench.common import (
     save_json,
     set_seed,
 )
-from emulator_bench.dataset import CachedEitlemDataset, EitlemDataLoader
+from emulator_bench.dataset import EitlemDataLoader
 from emulator_bench.feature_pipeline import LigandEmbeddingStore, ProteinEmbeddingStore
 from emulator_bench.modeling import build_model
 
 if str(EMULATOR_ROOT) not in sys.path:
     sys.path.insert(0, str(EMULATOR_ROOT))
 from src.utils.rich_progress import progress
-
-
-def _prepare_batch(batch, device: torch.device):
-    batch = batch.to(device)
-    batch.x = batch.x.float()
-    batch.pro_emb = batch.pro_emb.float()
-    if hasattr(batch, "value"):
-        batch.value = batch.value.float()
-    return batch
 
 
 def evaluate_loader(model, loader, device, amp_dtype=None, desc="Evaluation", show_progress=True):
@@ -50,7 +44,6 @@ def evaluate_loader(model, loader, device, amp_dtype=None, desc="Evaluation", sh
     iterator = progress(loader, desc=desc, unit="batch", leave=False) if show_progress else loader
     with torch.no_grad():
         for batch in iterator:
-            batch = _prepare_batch(batch, device)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
                 prediction = model(batch)
             prediction = prediction.float()
@@ -71,7 +64,6 @@ def train_one_epoch(model, loader, optimizer, device, amp_dtype=None, scaler=Non
     total_loss = 0.0
     total_samples = 0
     for batch in progress(loader, desc=desc, unit="batch", leave=False):
-        batch = _prepare_batch(batch, device)
         optimizer.zero_grad()
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
             prediction = model(batch)
@@ -116,9 +108,8 @@ def main():
 
     parser.add_argument("--amp", action="store_true", help="Mixed precision: bf16 on Ampere or newer, fp16 on older GPUs. Default is the original fp32.")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--num_workers", type=int, default=min(16, os.cpu_count() or 1))
-    parser.add_argument("--prefetch_factor", type=int, default=5)
-    parser.add_argument("--protein_cache_items", type=int, default=512)
+    parser.add_argument("--num_workers", type=int, default=8, help="Threads that build batches.")
+    parser.add_argument("--prefetch_factor", type=int, default=2, help="Batches built ahead. Each one holds GPU memory.")
     args = parser.parse_args()
 
     torch.backends.cudnn.allow_tf32 = True
@@ -137,7 +128,7 @@ def main():
         require_columns(frame, [args.sequence_col, args.smiles_col, args.target_col], paths[name])
     all_frame = pd.concat(frames.values(), ignore_index=True)
 
-    protein_store = ProteinEmbeddingStore(Path(args.embeddings_dir), max_items=args.protein_cache_items)
+    protein_store = ProteinEmbeddingStore(Path(args.embeddings_dir))
     ligand_store = LigandEmbeddingStore(
         Path(args.embeddings_dir),
         mol_type=args.mol_type,
@@ -145,17 +136,22 @@ def main():
         nbits=args.nbits,
         smiles_values=all_frame[args.smiles_col].astype(str).tolist(),
     )
-    loader_kwargs = {
-        "batch_size": args.batch_size,
-        "num_workers": args.num_workers,
-        "pin_memory": device.type == "cuda",
+    loaders = {
+        name: EitlemDataLoader(
+            frame,
+            protein_store,
+            ligand_store,
+            device,
+            args.batch_size,
+            shuffle=(name == "train"),
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            sequence_col=args.sequence_col,
+            smiles_col=args.smiles_col,
+            target_col=args.target_col,
+        )
+        for name, frame in frames.items()
     }
-    if args.num_workers > 0:
-        loader_kwargs.update(persistent_workers=True, prefetch_factor=args.prefetch_factor)
-    loaders = {}
-    for name, frame in frames.items():
-        dataset = CachedEitlemDataset(frame, protein_store, ligand_store, args.sequence_col, args.smiles_col, args.target_col)
-        loaders[name] = EitlemDataLoader(dataset, shuffle=(name == "train"), **loader_kwargs)
 
     model = build_model(
         predictor_type=args.predictor_type,

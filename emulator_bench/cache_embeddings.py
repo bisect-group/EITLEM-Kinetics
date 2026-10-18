@@ -1,4 +1,5 @@
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -24,7 +25,8 @@ from emulator_bench.common import (
     ensure_parent,
     ligand_cache_path,
     normalize_sequence,
-    protein_cache_path,
+    protein_cache_dir,
+    protein_cache_key,
     read_table,
     save_json,
 )
@@ -32,14 +34,17 @@ from emulator_bench.feature_pipeline import (
     build_esm_batches,
     embed_long_sequence,
     ligand_cache_item,
+    ProteinEmbeddingStore,
     load_esm1v_model,
-    protein_cache_item,
     _esm_forward,
 )
 
 if str(EMULATOR_ROOT) not in sys.path:
     sys.path.insert(0, str(EMULATOR_ROOT))
 from src.utils.rich_progress import progress
+
+
+SHARD_RESIDUES = 1_000_000  # about 5 GB per shard
 
 
 def _collect_unique_values(jobs, sequence_col: str, smiles_col: str):
@@ -63,8 +68,33 @@ def _save_npz(path: Path, item: dict) -> None:
     tmp_path.replace(path)
 
 
+def _save_protein_shard(directory: Path, embeddings: dict) -> None:
+    """Write one shard atomically: the `.json` index appears last, so a shard without it is ignored and rewritten."""
+    directory.mkdir(parents=True, exist_ok=True)
+    name = f"shard_{len(list(directory.glob('shard_*.json'))):05d}"
+    total = sum(len(embedding) for embedding in embeddings.values())
+    tmp_npy = directory / f"{name}.npy.tmp"
+    residues = np.lib.format.open_memmap(tmp_npy, mode="w+", dtype=np.float32, shape=(total, next(iter(embeddings.values())).shape[1]))
+    index, offset = {}, 0
+    for sequence, embedding in embeddings.items():
+        residues[offset : offset + len(embedding)] = embedding
+        index[protein_cache_key(sequence)] = [offset, len(embedding)]
+        offset += len(embedding)
+    residues.flush()
+    del residues
+    tmp_npy.replace(directory / f"{name}.npy")
+    tmp_json = directory / f"{name}.json.tmp"
+    tmp_json.write_text(json.dumps(index))
+    tmp_json.replace(directory / f"{name}.json")
+
+
 def cache_proteins(args, sequences):
-    pending = [seq for seq in sequences if args.overwrite or not protein_cache_path(args.embeddings_dir, seq).exists()]
+    directory = protein_cache_dir(args.embeddings_dir)
+    if args.overwrite:
+        for stale in directory.glob("shard_*"):
+            stale.unlink()
+    cached = ProteinEmbeddingStore(args.embeddings_dir).index
+    pending = [seq for seq in sequences if protein_cache_key(seq) not in cached]
     if not pending:
         print("Protein cache is already complete.")
         return {"proteins_total": len(sequences), "proteins_written": 0}
@@ -80,11 +110,12 @@ def cache_proteins(args, sequences):
     )
 
     written = 0
+    buffered = {}
     iterator = progress(batches, desc="Caching protein embeddings", unit="batch")
     for batch in iterator:
         if len(batch) == 1 and len(batch[0]) > MAX_SEQ_LEN:
             sequence = batch[0]
-            embedding = embed_long_sequence(
+            buffered[sequence] = embed_long_sequence(
                 model,
                 batch_converter,
                 sequence,
@@ -92,21 +123,12 @@ def cache_proteins(args, sequences):
                 max_window=MAX_SEQ_LEN,
                 stride=LONG_SEQ_STRIDE,
             )
-            _save_npz(
-                protein_cache_path(args.embeddings_dir, sequence),
-                protein_cache_item(embedding),
-            )
-            written += 1
-            iterator.set_postfix(written=written, remaining=len(pending) - written)
-            continue
-
-        embedded = _esm_forward(model, batch_converter, batch, device=device)
-        for sequence in batch:
-            _save_npz(
-                protein_cache_path(args.embeddings_dir, sequence),
-                protein_cache_item(embedded[sequence]),
-            )
-            written += 1
+        else:
+            buffered.update(_esm_forward(model, batch_converter, batch, device=device))
+        written += len(batch)
+        if sum(len(embedding) for embedding in buffered.values()) >= SHARD_RESIDUES or written == len(pending):
+            _save_protein_shard(directory, buffered)
+            buffered = {}
         iterator.set_postfix(written=written, remaining=len(pending) - written)
 
     return {"proteins_total": len(sequences), "proteins_written": written}

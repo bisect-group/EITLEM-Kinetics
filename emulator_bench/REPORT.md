@@ -89,6 +89,12 @@ A full 100-epoch run was not done.
 - mldb has no ESM1v loader. Install fair-esm in a separate env for real runs. Cache size is about 70 GB (fp32) for kcat and km together.
 - The paper's final model uses 8 rounds of iterative transfer learning with KKm data. The wrapper tests the base model only. KKm data is not in EMULaToR.
 - Model choice is the last epoch (original code), not best validation. Change only if the paper wants val-based selection.
-- Training 100 epochs with per-sample npz loading may be slow on the large splits. Use more `--num_workers`.
 - Weight decay 0.01 follows the code default (not set explicitly in the original code).
 - `torch.backends.cudnn.benchmark = True` is not in the original code. It is speed-only and can make runs slightly non-deterministic.
+
+## Training speed
+
+- Protein cache (`CACHE_VERSION` 3): flat uncompressed float32 shards read with mmap. Per-protein compressed `.npz` files cost about 13 ms per sample to decode and saved only 7% of disk.
+- Batches: `EitlemDataLoader` (in `dataset.py`) builds them in threads. Each thread fills a pinned buffer from the mmap and copies it to the GPU on a side CUDA stream, so the copy overlaps the previous step. It replaces the PyG `DataLoader` and its worker processes, so host memory no longer grows with workers.
+- Same batches, same math: the shuffle order, batch contents (`x`, `pro_emb`, `pro_emb_batch`, `value`) and model code are unchanged. Batches are not padded.
+- The cache must be rebuilt once after this change (`cache_embeddings.py`, or `run_split_benchmarks.py` without `--skip_cache`).

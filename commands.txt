@@ -11,13 +11,14 @@ $PY emulator_bench/run_split_benchmarks.py \
   --seeds 666 777 888 \
   --device cuda:0
 
-# 1b. Spread the runs over GPUs 0-3, two runs per GPU, bf16 mixed precision
-$PY emulator_bench/run_split_benchmarks.py --tasks kcat km --gpus 0 1 2 3 --runs_per_gpu 2 --amp
+# 1b. Spread the runs over GPUs 0-3, one run per GPU (two per A10 risk out-of-memory), bf16 mixed precision
+$PY emulator_bench/run_split_benchmarks.py --tasks kcat km --gpus 0 1 2 3 --amp
+#     --num_workers N: batch-building threads per run (default 8). --prefetch_factor N: batches built ahead (default 2).
 
 # 2. One task only
 $PY emulator_bench/run_split_benchmarks.py --tasks km --device cuda:0
 
-# 3. Build the cache alone
+# 3. Build the cache alone (flat protein shards in $OUT/embeddings/proteins_v3, resumable; version 3 needs one rebuild, old proteins_v2 can be deleted)
 $PY emulator_bench/cache_embeddings.py --device cuda:0
 
 # 4. Train one explicit split

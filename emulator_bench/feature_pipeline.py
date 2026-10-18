@@ -1,7 +1,7 @@
+import json
 import sys
 import zipfile
 import zlib
-from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -11,7 +11,7 @@ import torch
 from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem, MACCSkeys
 
-from emulator_bench.common import ligand_cache_path, normalize_sequence, protein_cache_path
+from emulator_bench.common import ligand_cache_path, normalize_sequence, protein_cache_dir, protein_cache_key
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -132,13 +132,6 @@ def featurize_smiles(smiles: str, mol_type: str = "MACCSKeys", radius: int = 4, 
     raise ValueError(f"Unsupported mol_type: {mol_type}")
 
 
-def protein_cache_item(embedding: np.ndarray) -> Dict[str, np.ndarray]:
-    return {
-        "embedding": embedding.astype(np.float32, copy=False),
-        "length": np.asarray([embedding.shape[0]], dtype=np.int32),
-    }
-
-
 def ligand_cache_item(smiles: str, mol_type: str = "MACCSKeys", radius: int = 4, nbits: int = 1024) -> Dict[str, np.ndarray]:
     fingerprint = featurize_smiles(smiles, mol_type=mol_type, radius=radius, nbits=nbits)
     return {
@@ -158,25 +151,22 @@ def load_npz(path: Path) -> Dict[str, np.ndarray]:
 
 
 class ProteinEmbeddingStore:
-    def __init__(self, embeddings_dir: Path, max_items: int = 512):
-        self.embeddings_dir = Path(embeddings_dir)
-        self.max_items = max(1, int(max_items))
-        self._cache: "OrderedDict[str, Dict[str, np.ndarray]]" = OrderedDict()
+    """Memory-mapped residue embeddings. Proteins are views into the shard files, so nothing is copied or kept per process."""
 
-    def get(self, sequence: str) -> Dict[str, np.ndarray]:
-        normalized = normalize_sequence(sequence)
-        if normalized in self._cache:
-            self._cache.move_to_end(normalized)
-            return self._cache[normalized]
+    def __init__(self, embeddings_dir: Path):
+        self.index: Dict[str, tuple] = {}
+        self.shards: List[np.ndarray] = []
+        for number, index_path in enumerate(sorted(protein_cache_dir(embeddings_dir).glob("shard_*.json"))):
+            self.shards.append(np.load(index_path.with_suffix(".npy"), mmap_mode="r"))
+            for key, (offset, length) in json.loads(index_path.read_text()).items():
+                self.index[key] = (number, offset, length)
 
-        path = protein_cache_path(self.embeddings_dir, normalized)
-        if not path.exists():
-            raise FileNotFoundError(f"Missing cached protein embedding: {path}")
-        item = load_npz(path)
-        self._cache[normalized] = item
-        if len(self._cache) > self.max_items:
-            self._cache.popitem(last=False)
-        return item
+    def get(self, sequence: str) -> np.ndarray:
+        key = protein_cache_key(normalize_sequence(sequence))
+        if key not in self.index:
+            raise FileNotFoundError(f"Missing cached protein embedding for sequence of length {len(sequence)}. Rebuild with `cache_embeddings.py`.")
+        number, offset, length = self.index[key]
+        return self.shards[number][offset : offset + length]
 
 
 class LigandEmbeddingStore:
