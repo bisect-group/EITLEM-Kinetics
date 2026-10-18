@@ -1,33 +1,25 @@
 import argparse
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
-try:
-    from src.utils.rich_progress import progress, write
-except ModuleNotFoundError:
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from src.utils.rich_progress import progress, write
-
-import sys
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from emulator_bench.common import (
-    DEFAULT_BASE_DIR,
-    DEFAULT_EMBEDDINGS_DIR,
+    DEFAULT_DATA_ROOT,
+    DEFAULT_OUTPUT_ROOT,
     DEFAULT_SPLIT_GROUPS,
+    EMULATOR_ROOT,
+    TASKS,
     discover_split_jobs,
     ensure_parent,
     ligand_cache_path,
     normalize_sequence,
-    normalize_threshold_args,
     protein_cache_path,
     read_table,
     save_json,
@@ -38,9 +30,12 @@ from emulator_bench.feature_pipeline import (
     ligand_cache_item,
     load_esm1v_model,
     protein_cache_item,
-    resolve_amp_dtype,
     _esm_forward,
 )
+
+if str(EMULATOR_ROOT) not in sys.path:
+    sys.path.insert(0, str(EMULATOR_ROOT))
+from src.utils.rich_progress import progress
 
 
 def _collect_unique_values(jobs, sequence_col: str, smiles_col: str):
@@ -71,8 +66,7 @@ def cache_proteins(args, sequences):
         return {"proteins_total": len(sequences), "proteins_written": 0}
 
     device = torch.device(args.device)
-    autocast_dtype, precision_mode = resolve_amp_dtype(device)
-    print(f"Protein cache device: {device} | precision: {precision_mode}")
+    print(f"Protein cache device: {device} | precision: fp32")
     model, batch_converter = load_esm1v_model(device)
     batches = build_esm_batches(
         pending,
@@ -91,23 +85,22 @@ def cache_proteins(args, sequences):
                 batch_converter,
                 sequence,
                 device=device,
-                autocast_dtype=autocast_dtype,
                 max_window=args.max_seq_len,
                 stride=args.long_seq_stride,
             )
             _save_npz(
                 protein_cache_path(args.embeddings_dir, sequence),
-                protein_cache_item(sequence, embedding, protein_dtype=args.protein_dtype),
+                protein_cache_item(embedding),
             )
             written += 1
             iterator.set_postfix(written=written, remaining=len(pending) - written)
             continue
 
-        embedded = _esm_forward(model, batch_converter, batch, device=device, autocast_dtype=autocast_dtype)
+        embedded = _esm_forward(model, batch_converter, batch, device=device)
         for sequence in batch:
             _save_npz(
                 protein_cache_path(args.embeddings_dir, sequence),
-                protein_cache_item(sequence, embedded[sequence], protein_dtype=args.protein_dtype),
+                protein_cache_item(embedded[sequence]),
             )
             written += 1
         iterator.set_postfix(written=written, remaining=len(pending) - written)
@@ -153,11 +146,10 @@ def cache_ligands(args, smiles_values):
 
 def main():
     parser = argparse.ArgumentParser(description="Cache reusable EITLEM-Kinetics protein embeddings and molecular fingerprints.")
-    parser.add_argument("--base_dir", type=str, default=str(DEFAULT_BASE_DIR))
-    parser.add_argument("--embeddings_dir", type=str, default=str(DEFAULT_EMBEDDINGS_DIR))
+    parser.add_argument("--tasks", nargs="+", choices=TASKS, default=list(TASKS))
+    parser.add_argument("--data_root", type=str, default=str(DEFAULT_DATA_ROOT))
+    parser.add_argument("--embeddings_dir", type=str, default=str(DEFAULT_OUTPUT_ROOT / "embeddings"))
     parser.add_argument("--split_groups", nargs="+", default=DEFAULT_SPLIT_GROUPS)
-    parser.add_argument("--threshold", type=str, default=None)
-    parser.add_argument("--thresholds", nargs="+", default=None)
     parser.add_argument("--sequence_col", type=str, default="sequence")
     parser.add_argument("--smiles_col", type=str, default="smiles")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
@@ -168,18 +160,16 @@ def main():
     parser.add_argument("--max_seq_len", type=int, default=1022)
     parser.add_argument("--max_batch", type=int, default=64)
     parser.add_argument("--long_seq_stride", type=int, default=800)
-    parser.add_argument("--protein_dtype", choices=["float16", "float32"], default="float16")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
-    args.base_dir = Path(args.base_dir)
+    args.data_root = Path(args.data_root)
     args.embeddings_dir = Path(args.embeddings_dir)
-    args.thresholds = normalize_threshold_args(args.thresholds, args.threshold)
     args.embeddings_dir.mkdir(parents=True, exist_ok=True)
 
-    jobs = discover_split_jobs(args.base_dir, split_groups=args.split_groups, thresholds=args.thresholds)
+    jobs = [job for task in args.tasks for job in discover_split_jobs(args.data_root / task, args.split_groups)]
     if not jobs:
-        raise FileNotFoundError(f"No split jobs discovered in {args.base_dir}")
+        raise FileNotFoundError(f"No split jobs discovered in {args.data_root}")
 
     started = time.time()
     sequences, smiles_values = _collect_unique_values(jobs, sequence_col=args.sequence_col, smiles_col=args.smiles_col)
@@ -192,16 +182,16 @@ def main():
 
     manifest = {
         "cache_version": 1,
-        "base_dir": str(args.base_dir),
+        "data_root": str(args.data_root),
+        "tasks": list(args.tasks),
         "embeddings_dir": str(args.embeddings_dir),
         "sequence_col": args.sequence_col,
         "smiles_col": args.smiles_col,
         "split_groups": list(args.split_groups),
-        "thresholds": args.thresholds,
         "mol_type": args.mol_type,
         "radius": int(args.radius),
         "nbits": int(args.nbits),
-        "protein_dtype": args.protein_dtype,
+        "protein_dtype": "float32",
         "protein_model": "esm1v_t33_650M_UR90S_1",
         "protein_max_seq_len": int(args.max_seq_len),
         "protein_long_seq_stride": int(args.long_seq_stride),

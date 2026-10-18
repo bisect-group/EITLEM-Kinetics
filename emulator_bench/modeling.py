@@ -11,7 +11,6 @@ if str(CODE_ROOT) not in sys.path:
 
 from KCM import EitlemKcatPredictor
 from KMP import EitlemKmPredictor
-from ensemble import ensemble
 
 
 def mol_feature_dim(mol_type: str, nbits: int) -> int:
@@ -39,6 +38,4 @@ def build_model(
         return EitlemKcatPredictor(in_dim, hidden_dim, protein_dim, layer, dropout, att_layer)
     if predictor_type == "km":
         return EitlemKmPredictor(in_dim, hidden_dim, protein_dim, layer, dropout, att_layer)
-    if predictor_type == "kkm":
-        return ensemble(in_dim, hidden_dim, protein_dim, layer, dropout, att_layer)
     raise ValueError(f"Unsupported predictor_type: {predictor_type}")

@@ -12,17 +12,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from emulator_bench.common import DEFAULT_EMBEDDINGS_DIR, read_table, regression_metrics, require_columns, save_json
+from emulator_bench.common import DEFAULT_OUTPUT_ROOT, read_table, regression_metrics, require_columns, save_json
 from emulator_bench.dataset import CachedEitlemDataset, EitlemDataLoader
-from emulator_bench.feature_pipeline import LigandEmbeddingStore, ProteinEmbeddingStore, resolve_amp_dtype
+from emulator_bench.feature_pipeline import LigandEmbeddingStore, ProteinEmbeddingStore
 from emulator_bench.modeling import build_model
-from emulator_bench.train_single_target_tvt import _autocast_context, _prepare_batch
+from emulator_bench.train_single_target_tvt import _prepare_batch
 
 
 def main():
     parser = argparse.ArgumentParser(description="Run inference for one split file using a trained emulator bench checkpoint.")
     parser.add_argument("--input_path", type=str, required=True)
-    parser.add_argument("--embeddings_dir", type=str, default=str(DEFAULT_EMBEDDINGS_DIR))
+    parser.add_argument("--embeddings_dir", type=str, default=str(DEFAULT_OUTPUT_ROOT / "embeddings"))
     parser.add_argument("--ckpt_path", type=str, required=True)
     parser.add_argument("--out_csv", type=str, required=True)
     parser.add_argument("--sequence_col", type=str, default="sequence")
@@ -40,14 +40,11 @@ def main():
     checkpoint = torch.load(args.ckpt_path, map_location="cpu")
     train_args = checkpoint["args"]
     device = torch.device(args.device)
-    autocast_dtype, precision_mode = resolve_amp_dtype(device)
 
     frame = read_table(Path(args.input_path))
     require_columns(frame, [args.sequence_col, args.smiles_col], Path(args.input_path))
     protein_store = ProteinEmbeddingStore(
         Path(args.embeddings_dir),
-        sequences=frame[args.sequence_col].astype(str).tolist(),
-        preload=False,
         max_items=args.protein_cache_items,
     )
     ligand_store = LigandEmbeddingStore(
@@ -73,11 +70,11 @@ def main():
         predictor_type=train_args["predictor_type"],
         mol_type=train_args["mol_type"],
         nbits=int(train_args["nbits"]),
-        hidden_dim=int(train_args["hidden_dim"]),
-        protein_dim=int(train_args["protein_dim"]),
-        layer=int(train_args["layer"]),
-        dropout=float(train_args["dropout"]),
-        att_layer=int(train_args["att_layer"]),
+        hidden_dim=512,
+        protein_dim=1280,
+        layer=10,
+        dropout=0.5,
+        att_layer=10,
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
@@ -87,8 +84,7 @@ def main():
     with torch.no_grad():
         for batch in loader:
             batch = _prepare_batch(batch, device)
-            with _autocast_context(device, autocast_dtype):
-                prediction = model(batch)
+            prediction = model(batch)
             preds.append(prediction.detach().cpu().float())
             if hasattr(batch, "value"):
                 truths.append(batch.value.detach().cpu().float())
@@ -113,7 +109,7 @@ def main():
                 "checkpoint_path": args.ckpt_path,
                 "output_csv": str(out_csv),
                 "metrics_csv": str(metrics_path),
-                "precision_mode": precision_mode,
+                "precision_mode": "fp32",
             },
         )
 

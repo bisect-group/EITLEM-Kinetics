@@ -1,11 +1,7 @@
-import io
-import math
-import os
 import sys
 import zipfile
 import zlib
 from collections import OrderedDict
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -28,22 +24,6 @@ if str(CODE_ROOT) not in sys.path:
 
 RDLogger.DisableLog("rdApp.*")
 RDKIT_FPGEN = AllChem.GetRDKitFPGenerator(fpSize=1024)
-
-
-def _autocast_context(device: torch.device, dtype=None):
-    if device.type == "cuda" and dtype is not None:
-        return torch.autocast(device_type="cuda", dtype=dtype)
-    return nullcontext()
-
-
-def resolve_amp_dtype(device: torch.device):
-    if device.type != "cuda" or not torch.cuda.is_available():
-        return None, "fp32"
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    major, _minor = torch.cuda.get_device_capability(index)
-    if major >= 8:
-        return torch.bfloat16, "bf16-mixed"
-    return torch.float16, "fp16-mixed"
 
 
 def load_esm1v_model(device: torch.device):
@@ -87,11 +67,11 @@ def build_esm_batches(
     return batches
 
 
-def _esm_forward(model, batch_converter, sequences: Sequence[str], device: torch.device, autocast_dtype=None) -> Dict[str, np.ndarray]:
+def _esm_forward(model, batch_converter, sequences: Sequence[str], device: torch.device) -> Dict[str, np.ndarray]:
     labels = [(f"seq_{idx}", seq) for idx, seq in enumerate(sequences)]
     _, batch_strs, tokens = batch_converter(labels)
     tokens = tokens.to(device, non_blocking=True)
-    with torch.no_grad(), _autocast_context(device, autocast_dtype):
+    with torch.no_grad():
         result = model(tokens, repr_layers=[33], return_contacts=False)
     representations = result["representations"][33].detach().cpu().float()
     embedded: Dict[str, np.ndarray] = {}
@@ -105,12 +85,11 @@ def embed_long_sequence(
     batch_converter,
     sequence: str,
     device: torch.device,
-    autocast_dtype=None,
     max_window: int = 1022,
     stride: int = 800,
 ) -> np.ndarray:
     if len(sequence) <= max_window:
-        return _esm_forward(model, batch_converter, [sequence], device=device, autocast_dtype=autocast_dtype)[sequence]
+        return _esm_forward(model, batch_converter, [sequence], device=device)[sequence]
 
     if stride >= max_window:
         raise ValueError("stride must be smaller than max_window for long-sequence ESM extraction")
@@ -126,7 +105,6 @@ def embed_long_sequence(
             batch_converter,
             [window_sequence],
             device=device,
-            autocast_dtype=autocast_dtype,
         )[window_sequence].astype(np.float32, copy=False)
         if accum is None:
             accum = np.zeros((len(sequence), window_embedding.shape[-1]), dtype=np.float32)
@@ -154,10 +132,9 @@ def featurize_smiles(smiles: str, mol_type: str = "MACCSKeys", radius: int = 4, 
     raise ValueError(f"Unsupported mol_type: {mol_type}")
 
 
-def protein_cache_item(sequence: str, embedding: np.ndarray, protein_dtype: str = "float16") -> Dict[str, np.ndarray]:
-    target_dtype = np.float16 if protein_dtype == "float16" else np.float32
+def protein_cache_item(embedding: np.ndarray) -> Dict[str, np.ndarray]:
     return {
-        "embedding": embedding.astype(target_dtype, copy=False),
+        "embedding": embedding.astype(np.float32, copy=False),
         "length": np.asarray([embedding.shape[0]], dtype=np.int32),
     }
 
@@ -181,17 +158,10 @@ def load_npz(path: Path) -> Dict[str, np.ndarray]:
 
 
 class ProteinEmbeddingStore:
-    def __init__(self, embeddings_dir: Path, sequences: Optional[Sequence[str]] = None, preload: bool = False, max_items: int = 512):
+    def __init__(self, embeddings_dir: Path, max_items: int = 512):
         self.embeddings_dir = Path(embeddings_dir)
         self.max_items = max(1, int(max_items))
         self._cache: "OrderedDict[str, Dict[str, np.ndarray]]" = OrderedDict()
-        if preload and sequences is not None:
-            unique_sequences = sorted({normalize_sequence(sequence) for sequence in sequences})
-            for sequence in unique_sequences:
-                path = protein_cache_path(self.embeddings_dir, sequence)
-                if not path.exists():
-                    raise FileNotFoundError(f"Missing cached protein embedding: {path}")
-                self._cache[sequence] = load_npz(path)
 
     def get(self, sequence: str) -> Dict[str, np.ndarray]:
         normalized = normalize_sequence(sequence)
