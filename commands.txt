@@ -1,38 +1,43 @@
-# Run from the EITLEM-Kinetics folder. Data root and output root default to the EMULaToR layout:
+# Run from baselines/EITLEM-Kinetics (the submodule root). Data root and output root default to the EMULaToR layout:
 #   data:    <EMULaToR>/data/processed/datasets/kinetic_dataset/{kcat,km}
-#   outputs: <EMULaToR>/outputs/baselines/EITLEM-Kinetics
+#   outputs: <EMULaToR>/outputs/baselines/EITLEM-Kinetics  (cache in embeddings/, runs in <task>/<split_group>/<split_name>/seed_<n>/)
 # Needs a Python env with fair-esm (esm.pretrained.esm1v_t33_650M_UR90S_1), torch_geometric and rdkit.
+PY=/home/adhil/.conda/envs/mldb/bin/python
+OUT=../../outputs/baselines/EITLEM-Kinetics
 
 # 1. All tasks, all default splits, seeds 666 777 888 (the cache is built first)
-python emulator_bench/run_split_benchmarks.py \
+$PY emulator_bench/run_split_benchmarks.py \
   --tasks kcat km \
   --seeds 666 777 888 \
   --device cuda:0
 
+# 1b. Spread the runs over GPUs 0-3, two runs per GPU, bf16 mixed precision
+$PY emulator_bench/run_split_benchmarks.py --tasks kcat km --gpus 0 1 2 3 --runs_per_gpu 2 --amp
+
 # 2. One task only
-python emulator_bench/run_split_benchmarks.py --tasks km --device cuda:0
+$PY emulator_bench/run_split_benchmarks.py --tasks km --device cuda:0
 
 # 3. Build the cache alone
-python emulator_bench/cache_embeddings.py --device cuda:0
+$PY emulator_bench/cache_embeddings.py --device cuda:0
 
 # 4. Train one explicit split
-python emulator_bench/train_single_target_tvt.py \
+$PY emulator_bench/train_single_target_tvt.py \
   --train_path <split_dir>/train.parquet \
   --val_path <split_dir>/val.parquet \
   --test_path <split_dir>/test.parquet \
-  --embeddings_dir <output_dir>/embeddings \
-  --out_dir <output_dir>/kcat/results/<split_group>/<split_name>/seed_666 \
+  --embeddings_dir $OUT/embeddings \
+  --out_dir $OUT/kcat/<split_group>/<split_name>/seed_666 \
   --predictor_type kcat \
   --seed 666 \
   --device cuda:0
 
 # 5. Mean and std over seeds
-python emulator_bench/aggregate_eitlem_results.py
+$PY emulator_bench/aggregate_eitlem_results.py
 
 # 6. Predict from a saved model
-python emulator_bench/predict_single_target.py \
+$PY emulator_bench/predict_single_target.py \
   --input_path <split_dir>/test.parquet \
-  --embeddings_dir <output_dir>/embeddings \
-  --ckpt_path <output_dir>/kcat/results/<split_group>/<split_name>/seed_666/final_model.pth \
-  --out_csv <output_dir>/kcat/results/<split_group>/<split_name>/seed_666/test_predictions_from_ckpt.csv \
+  --embeddings_dir $OUT/embeddings \
+  --ckpt_path $OUT/kcat/<split_group>/<split_name>/seed_666/lastmodel.pth \
+  --out_csv $OUT/kcat/<split_group>/<split_name>/seed_666/test_predictions_from_ckpt.csv \
   --device cuda:0

@@ -32,6 +32,12 @@ DEFAULT_SPLIT_GROUPS = [
 ]
 DEFAULT_SEEDS = [666, 777, 888]
 TASKS = ("kcat", "km")
+CACHE_VERSION = 2
+ESM_MODEL = "esm1v_t33_650M_UR90S_1"
+ESM_LAYER = 33
+PROTEIN_DTYPE = "float32"
+MAX_SEQ_LEN = 1022
+LONG_SEQ_STRIDE = 800
 
 
 def stable_hash(text: str) -> str:
@@ -43,7 +49,8 @@ def normalize_sequence(sequence: str) -> str:
 
 
 def protein_cache_key(sequence: str) -> str:
-    return stable_hash(normalize_sequence(sequence))
+    settings = f"{ESM_MODEL}|layer={ESM_LAYER}|{PROTEIN_DTYPE}|max_seq_len={MAX_SEQ_LEN}|stride={LONG_SEQ_STRIDE}"
+    return stable_hash(f"{settings}|{normalize_sequence(sequence)}")
 
 
 def ligand_cache_key(smiles: str, mol_type: str, radius: int, nbits: int) -> str:
@@ -53,13 +60,13 @@ def ligand_cache_key(smiles: str, mol_type: str, radius: int, nbits: int) -> str
 
 def protein_cache_path(embeddings_dir: Path, sequence: str) -> Path:
     key = protein_cache_key(sequence)
-    return Path(embeddings_dir) / "proteins" / key[:2] / f"{key}.npz"
+    return Path(embeddings_dir) / f"proteins_v{CACHE_VERSION}" / key[:2] / f"{key}.npz"
 
 
 def ligand_cache_path(embeddings_dir: Path, smiles: str, mol_type: str, radius: int, nbits: int) -> Path:
     key = ligand_cache_key(smiles, mol_type=mol_type, radius=radius, nbits=nbits)
     safe_mol_type = str(mol_type).replace("/", "_")
-    return Path(embeddings_dir) / "ligands" / safe_mol_type / key[:2] / f"{key}.npz"
+    return Path(embeddings_dir) / f"ligands_v{CACHE_VERSION}" / safe_mol_type / key[:2] / f"{key}.npz"
 
 
 def ensure_parent(path: Path) -> None:
@@ -92,6 +99,15 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def resolve_amp_dtype(device: torch.device):
+    """bf16 on Ampere or newer, fp16 on older GPUs, None (fp32) on CPU."""
+    if device.type != "cuda":
+        return None, "fp32"
+    if torch.cuda.get_device_capability(device)[0] >= 8:
+        return torch.bfloat16, "bf16"
+    return torch.float16, "fp16"
+
+
 def read_table(path: Path) -> pd.DataFrame:
     suffix = path.suffix.lower()
     if suffix == ".parquet":
@@ -122,7 +138,7 @@ def discover_split_jobs(base_dir: Path, split_groups: Optional[Iterable[str]] = 
         group_dir = Path(base_dir) / split_group
         if not group_dir.exists():
             continue
-        candidates = [(split_group, group_dir)]
+        candidates = [("all", group_dir)]
         candidates += [(child.name, child) for child in sorted(group_dir.glob("threshold_*")) if child.is_dir()]
         for split_name, directory in candidates:
             paths = [_find_split_file(directory, stem) for stem in ("train", "val", "test")]

@@ -32,7 +32,7 @@ So the code values above are the reference. The old wrapper JSON had weight deca
 Splits are found on disk: random_splits_grouped_sequence, random_splits_grouped_smiles, uniprot_time_splits,
 enzyme_sequence_splits/threshold_*, substrate_splits/threshold_*.
 Each run trains 100 epochs, logs val metrics per epoch, and evaluates the final-epoch model on train, val and test.
-Outputs: `<output_dir>/<task>/results/<split_group>/<split_name>/seed_<n>/`.
+Outputs: `<output_dir>/<task>/<split_group>/<split_name>/seed_<n>/`.
 Default output dir is `EMULaToR/outputs/baselines/EITLEM-Kinetics` (gitignored). Nothing is written under `data/`.
 `aggregate_eitlem_results.py` gives mean and std over seeds.
 
@@ -47,7 +47,7 @@ Default output dir is `EMULaToR/outputs/baselines/EITLEM-Kinetics` (gitignored).
 - run_split_benchmarks.py: task x split x seed loop only; no hyperparameter flags.
 - cache_embeddings.py, feature_pipeline.py: fp32 ESM1v and fp32 cache, no autocast; multi-task discovery.
 - modeling.py: kcat and km only. The kkm ensemble is removed.
-- predict_single_target.py: uses `final_model.pth`, fp32.
+- predict_single_target.py: uses `lastmodel.pth`, fp32.
 - aggregate_eitlem_results.py: rewritten for the new layout.
 - README.md (emulator_bench) and commands.txt (submodule root): rewritten, no Optuna, no foreign home paths.
 

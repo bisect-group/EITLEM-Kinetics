@@ -13,8 +13,12 @@ if str(REPO_ROOT) not in sys.path:
 from emulator_bench.common import (
     DEFAULT_DATA_ROOT,
     DEFAULT_OUTPUT_ROOT,
+    CACHE_VERSION,
     DEFAULT_SPLIT_GROUPS,
     EMULATOR_ROOT,
+    ESM_MODEL,
+    LONG_SEQ_STRIDE,
+    MAX_SEQ_LEN,
     TASKS,
     discover_split_jobs,
     ensure_parent,
@@ -71,22 +75,22 @@ def cache_proteins(args, sequences):
     batches = build_esm_batches(
         pending,
         max_residues=args.max_residues,
-        max_seq_len=args.max_seq_len,
+        max_seq_len=MAX_SEQ_LEN,
         max_batch=args.max_batch,
     )
 
     written = 0
     iterator = progress(batches, desc="Caching protein embeddings", unit="batch")
     for batch in iterator:
-        if len(batch) == 1 and len(batch[0]) > args.max_seq_len:
+        if len(batch) == 1 and len(batch[0]) > MAX_SEQ_LEN:
             sequence = batch[0]
             embedding = embed_long_sequence(
                 model,
                 batch_converter,
                 sequence,
                 device=device,
-                max_window=args.max_seq_len,
-                stride=args.long_seq_stride,
+                max_window=MAX_SEQ_LEN,
+                stride=LONG_SEQ_STRIDE,
             )
             _save_npz(
                 protein_cache_path(args.embeddings_dir, sequence),
@@ -157,9 +161,7 @@ def main():
     parser.add_argument("--radius", type=int, default=4)
     parser.add_argument("--nbits", type=int, default=1024)
     parser.add_argument("--max_residues", type=int, default=12000)
-    parser.add_argument("--max_seq_len", type=int, default=1022)
     parser.add_argument("--max_batch", type=int, default=64)
-    parser.add_argument("--long_seq_stride", type=int, default=800)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
@@ -181,7 +183,7 @@ def main():
     ligand_stats = cache_ligands(args, smiles_values)
 
     manifest = {
-        "cache_version": 1,
+        "cache_version": CACHE_VERSION,
         "data_root": str(args.data_root),
         "tasks": list(args.tasks),
         "embeddings_dir": str(args.embeddings_dir),
@@ -192,9 +194,9 @@ def main():
         "radius": int(args.radius),
         "nbits": int(args.nbits),
         "protein_dtype": "float32",
-        "protein_model": "esm1v_t33_650M_UR90S_1",
-        "protein_max_seq_len": int(args.max_seq_len),
-        "protein_long_seq_stride": int(args.long_seq_stride),
+        "protein_model": ESM_MODEL,
+        "protein_max_seq_len": MAX_SEQ_LEN,
+        "protein_long_seq_stride": LONG_SEQ_STRIDE,
         "protein_cache": protein_stats,
         "ligand_cache": ligand_stats,
         "elapsed_seconds": time.time() - started,

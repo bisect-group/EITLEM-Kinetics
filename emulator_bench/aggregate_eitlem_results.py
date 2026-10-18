@@ -1,6 +1,6 @@
 """Aggregate EITLEM-Kinetics results over seeds.
 
-Reads `<output_dir>/<task>/results/<split_group>/<split_name>/seed_<n>/final_results_{val,test}.csv`
+Reads `<output_dir>/<task>/<split_group>/<split_name>/seed_<n>/final_results_{val,test}.csv`
 and writes `<output_dir>/aggregate_eitlem_results.csv` with the mean and std of every metric.
 """
 
@@ -26,9 +26,9 @@ def main():
     output_dir = Path(args.output_dir)
 
     rows = []
-    for test_csv in sorted(output_dir.glob("*/results/*/*/seed_*/final_results_test.csv")):
+    for test_csv in sorted(output_dir.glob("*/*/*/seed_*/final_results_test.csv")):
         seed_dir = test_csv.parent
-        task, _, split_group, split_name, seed = seed_dir.relative_to(output_dir).parts
+        task, split_group, split_name, seed = seed_dir.relative_to(output_dir).parts
         for partition in ("val", "test"):
             metrics = pd.read_csv(seed_dir / f"final_results_{partition}.csv").iloc[0]
             rows.append(
