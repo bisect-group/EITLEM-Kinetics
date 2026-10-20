@@ -1,6 +1,7 @@
 import argparse
 import datetime
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -80,6 +81,101 @@ def train_one_epoch(model, loader, optimizer, device, amp_dtype=None, scaler=Non
     return total_loss / max(1, total_samples)
 
 
+RESUME_KEYS = (
+    "task_name",
+    "train_path",
+    "val_path",
+    "test_path",
+    "seed",
+    "epochs",
+    "batch_size",
+    "lr",
+    "amp",
+    "predictor_type",
+    "mol_type",
+    "radius",
+    "nbits",
+)
+
+
+def rng_state() -> dict:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def set_rng_state(state: dict) -> None:
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if state["cuda"] is not None:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def save_checkpoint(path: Path, **state) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(state, tmp)
+    os.replace(tmp, path)
+
+
+def fit(args, model, optimizer, scheduler, scaler, loaders, device, amp_dtype, out_dir: Path, resume: bool = True):
+    """Trains `args.epochs` epochs and writes `checkpoint.pth` after each one.
+
+    The checkpoint holds every state that affects later epochs. The shuffle order comes from the global
+    torch RNG (`RandomSampler` draws its seed from it), so the RNG state covers it. Resuming
+    restores the checkpointed state and `logfile.csv` rows, so the result equals an uninterrupted run.
+    """
+    checkpoint_path, logfile = out_dir / "checkpoint.pth", out_dir / "logfile.csv"
+    key_args = {key: getattr(args, key) for key in RESUME_KEYS}
+    rows, start_epoch, elapsed_before = [], 1, 0.0
+    if resume and checkpoint_path.exists():
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        changed = {key: (checkpoint["key_args"][key], value) for key, value in key_args.items() if checkpoint["key_args"][key] != value}
+        if changed:
+            raise SystemExit(f"Cannot resume {checkpoint_path}: arguments differ (checkpoint, now): {changed}. Use --no_resume to start fresh.")
+        model.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        scheduler.load_state_dict(checkpoint["scheduler"])
+        if scaler is not None:
+            scaler.load_state_dict(checkpoint["scaler"])
+        set_rng_state(checkpoint["rng"])
+        for name in ("train", "val"):  # the first pass of each loader already drew its base seed
+            loaders[name].seeded = True
+        rows, start_epoch, elapsed_before = checkpoint["rows"], checkpoint["epoch"] + 1, checkpoint["elapsed_seconds"]
+        print(f"Resuming from epoch {checkpoint['epoch']}", flush=True)
+    else:
+        checkpoint_path.unlink(missing_ok=True)
+    logfile.unlink(missing_ok=True)
+    for row in rows:
+        append_csv_row(logfile, row)
+
+    started = time.time()
+    for epoch in progress(range(start_epoch, args.epochs + 1), desc="Training", unit="epoch"):
+        row = {"epoch": epoch, "lr": optimizer.param_groups[0]["lr"]}
+        row["train_loss"] = train_one_epoch(model, loaders["train"], optimizer, device, amp_dtype, scaler, desc=f"Epoch {epoch} train")
+        _, _, val_metrics = evaluate_loader(model, loaders["val"], device, amp_dtype, show_progress=False)
+        row.update({f"val_{key}": value for key, value in val_metrics.items()})
+        row["elapsed_seconds"] = elapsed_before + time.time() - started
+        scheduler.step()
+        rows.append(row)
+        append_csv_row(logfile, row)
+        save_checkpoint(
+            checkpoint_path,
+            key_args=key_args,
+            epoch=epoch,
+            model=model.state_dict(),
+            optimizer=optimizer.state_dict(),
+            scheduler=scheduler.state_dict(),
+            scaler=None if scaler is None else scaler.state_dict(),
+            rng=rng_state(),
+            rows=rows,
+            elapsed_seconds=row["elapsed_seconds"],
+        )
+
+
 def save_predictions(path: Path, y_true: np.ndarray, y_pred: np.ndarray) -> None:
     pd.DataFrame({"y_true": y_true, "y_pred": y_pred}).to_csv(path, index=False)
 
@@ -106,7 +202,10 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=666)
 
-    parser.add_argument("--amp", action="store_true", help="Mixed precision: bf16 on Ampere or newer, fp16 on older GPUs. Default is the original fp32.")
+    parser.add_argument("--no_resume", action="store_true", help="Ignore checkpoint.pth and start from epoch 1.")
+    parser.add_argument(
+        "--amp", action="store_true", help="Mixed precision: bf16 on Ampere or newer, fp16 on older GPUs. Default is the original fp32."
+    )
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--num_workers", type=int, default=8, help="Threads that build batches.")
     parser.add_argument("--prefetch_factor", type=int, default=2, help="Batches built ahead. Each one holds GPU memory.")
@@ -170,14 +269,7 @@ def main():
     started = time.time()
     print(f"Device: {device} | precision: {precision_mode}", flush=True)
 
-    for epoch in progress(range(1, args.epochs + 1), desc="Training", unit="epoch"):
-        row = {"epoch": epoch, "lr": optimizer.param_groups[0]["lr"]}
-        row["train_loss"] = train_one_epoch(model, loaders["train"], optimizer, device, amp_dtype, scaler, desc=f"Epoch {epoch} train")
-        _, _, val_metrics = evaluate_loader(model, loaders["val"], device, amp_dtype, show_progress=False)
-        row.update({f"val_{key}": value for key, value in val_metrics.items()})
-        row["elapsed_seconds"] = time.time() - started
-        scheduler.step()
-        append_csv_row(out_dir / "logfile.csv", row)
+    fit(args, model, optimizer, scheduler, scaler, loaders, device, amp_dtype, out_dir, resume=not args.no_resume)
 
     # The original code keeps only the weights of the last epoch.
     torch.save({"model_state_dict": model.state_dict(), "epoch": args.epochs, "args": vars(args)}, out_dir / "lastmodel.pth")
@@ -206,6 +298,7 @@ def main():
             "args": vars(args),
         },
     )
+    (out_dir / "checkpoint.pth").unlink(missing_ok=True)  # last, so a kill during the final evaluation resumes at the last epoch
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ from emulator_bench.common import (
 if str(EMULATOR_ROOT) not in sys.path:
     sys.path.insert(0, str(EMULATOR_ROOT))
 from src.utils.rich_progress import progress
+from emulator_bench.esm_deps import setup_esm
 
 CACHE_SCRIPT = REPO_ROOT / "emulator_bench" / "cache_embeddings.py"
 TRAIN_SCRIPT = REPO_ROOT / "emulator_bench" / "train_single_target_tvt.py"
@@ -49,7 +50,11 @@ def main():
     parser.add_argument("--runs_per_gpu", type=int, default=1, help="Concurrent runs per GPU (per --device when --gpus is not set).")
     parser.add_argument("--amp", action="store_true", help="Mixed precision: bf16 on Ampere or newer, fp16 on older GPUs. Default is fp32.")
     parser.add_argument("--skip_cache", action="store_true")
-    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Retrain finished runs and ignore checkpoints. Without it, finished runs are skipped and unfinished runs resume.",
+    )
     parser.add_argument("--epochs", type=int, default=100, help="Original value is 100. Change it only for smoke tests.")
     parser.add_argument("--num_workers", type=int, default=8, help="Batch-building threads per run.")
     parser.add_argument("--prefetch_factor", type=int, default=2, help="Batches built ahead per run. Each one holds GPU memory.")
@@ -58,6 +63,7 @@ def main():
     data_root = Path(args.data_root)
     output_dir = Path(args.output_dir)
     embeddings_dir = output_dir / "embeddings"
+    setup_esm(output_dir)  # child processes inherit PYTHONPATH and TORCH_HOME
     run_device = "cuda:0" if args.gpus else args.device
     cache_env = {**os.environ, "CUDA_VISIBLE_DEVICES": args.gpus[0]} if args.gpus else None
 
@@ -119,7 +125,7 @@ def main():
             "--seed",
             str(seed),
         ]
-        commands.append(cmd + ["--amp"] if args.amp else cmd)
+        commands.append(cmd + (["--amp"] if args.amp else []) + (["--no_resume"] if args.overwrite else []))
 
     slots = queue.Queue()
     for gpu in args.gpus or [None]:

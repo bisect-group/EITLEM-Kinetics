@@ -5,13 +5,16 @@ import zlib
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
-import esm
 import numpy as np
 import torch
 from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem, MACCSkeys
 
-from emulator_bench.common import ligand_cache_path, normalize_sequence, protein_cache_dir, protein_cache_key
+from emulator_bench.common import DEFAULT_OUTPUT_ROOT, ligand_cache_path, normalize_sequence, protein_cache_dir, protein_cache_key
+from emulator_bench.esm_deps import setup_esm
+
+setup_esm(DEFAULT_OUTPUT_ROOT)  # no-op when the launcher already set it up for another output dir
+import esm  # noqa: E402
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

@@ -28,7 +28,9 @@ DEFAULT_SPLIT_GROUPS = [
     "random_splits_grouped_smiles",
     "uniprot_time_splits",
     "enzyme_sequence_splits",
+    "enzyme_structure_splits",
     "substrate_splits",
+    "conformer_cosine_splits",
 ]
 DEFAULT_SEEDS = [666, 777, 888]
 TASKS = ("kcat", "km")

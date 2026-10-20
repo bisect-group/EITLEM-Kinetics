@@ -42,3 +42,10 @@ $PY emulator_bench/predict_single_target.py \
   --ckpt_path $OUT/kcat/<split_group>/<split_name>/seed_666/lastmodel.pth \
   --out_csv $OUT/kcat/<split_group>/<split_name>/seed_666/test_predictions_from_ckpt.csv \
   --device cuda:0
+
+# Host setup on e2ea100_2 (conda env eitlem; see emulator_bench/README.md)
+#   ~/miniconda3/bin/conda create -y -n eitlem python=3.12
+#   E=~/miniconda3/envs/eitlem/bin
+#   $E/pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cu130
+#   $E/pip install torch_geometric==2.8.0 rdkit==2026.3.3 numpy==2.4.4 pandas==2.3.3 scikit-learn==1.8.0 scipy==1.17.1 pyarrow==23.0.1 rich==14.3.3 tqdm==4.68.2 xxhash==3.7.0
+#   CUDA_VISIBLE_DEVICES=1 $E/python emulator_bench/run_split_benchmarks.py --tasks kcat --seeds 666 --gpus 1
