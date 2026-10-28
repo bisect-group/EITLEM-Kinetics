@@ -44,6 +44,28 @@ After each epoch the training script writes `checkpoint.pth` (atomic) in the run
 If `checkpoint.pth` exists at start, the script restores it, rewrites `logfile.csv` to the checkpointed rows and continues at the next epoch. It stops with an error if task, split paths, seed, epochs, batch size, lr, precision, fingerprint or predictor type differ. `--no_resume` ignores the checkpoint and starts at epoch 1 with a new `logfile.csv`.
 The script deletes `checkpoint.pth` after `run_summary.json` is written. A resumed run is exact on CPU with deterministic settings. On GPU, nondeterministic kernels (and `cudnn.benchmark`) can make the numbers differ slightly.
 
+## Verify equivalence
+
+```
+emulator_bench/verify_equivalence.sh          # CPU, fp32, about 10 s
+emulator_bench/verify_equivalence.sh --gpu    # also the CUDA tests; needs one CUDA device
+emulator_bench/verify_equivalence.sh --negative-control  # GPU precision test must FAIL
+```
+
+Expected env: `mldb` (torch, torch_geometric, rdkit, pandas, pytest, Biohub `esm`). Never `pip install fair-esm`: it overwrites the Biohub `esm` package. `esm_deps.py` (`setup_esm`) unpacks the sha256-checked fair-esm 2.0.0 wheel from PyPI into `<out_root>/pydeps` and puts it first on `sys.path`. It never touches site-packages. The tests reach fair-esm only this way, through `emulator_bench.feature_pipeline`. The first run needs network once unless `<out_root>/pydeps` exists. The script does not create envs. It fails if any CPU test is skipped. It needs no private data: it builds synthetic proteins and a tiny random ESM1v-shaped model.
+
+What `emulator_bench/tests/test_original_equivalence.py` compares:
+- Batches: `EitlemDataLoader` against the original PyG `DataLoader` (shuffle, persistent workers), over three epochs. Batches must be identical.
+- Training: `fit` against the original `Trainer` and `Tester` loop, for kcat and km, with the original model classes at hidden size 64 and 3 layers. Losses and final weights within rtol 1e-5.
+- ESM1v features, split batches: 40 sequences of 300-900 residues, so the length-sorted batching at 12000 residues makes several batches. Same tolerance.
+- ESM1v features, long protein: a 1900-residue protein embedded in 1022-residue windows at stride 800 equals the average of the original per-window features. Same tolerance.
+- ESM1v features: the cache builder and memory-mapped store against `Code/extract.py`, on a random ESM1v-shaped network (33 layers, 16-d). Features within rtol 1e-4. Add `-m esm_weights` to run the same check with the real weights; it skips if `$TORCH_HOME/hub/checkpoints` has none.
+- `--gpu`, loader: the side-stream copies give the CPU loader batches, in the same order.
+- `--gpu`, precision: the production flags (TF32 and `cudnn.benchmark`) against deterministic fp32, same seed and batches. A noise control reruns the production path with initial weights perturbed by 2**-11 (relative, one TF32 rounding). The per-step loss gap and the final validation MSE gap between production and fp32 must be within 10 times the gap the perturbation causes. Step 0 is judged like every other step: its gap must be at most 10 times its floor. The test prints the measured ratio (run with `-s`).
+- `--negative-control`: reruns only that test with the production run's initial weights multiplied by 1.05 (`EQUIV_NEGATIVE_CONTROL=1`). The test must fail. The script exits 0 only then.
+
+Production training is fp32 with TF32. `--amp` is not used for the runs: it was slower. The tests use a smaller model and a random encoder, so they do not check the real ESM1v weights or the full model size. TF32 differs from fp32 by rounding.
+
 ## Output layout
 
 - `embeddings/proteins_v3/`, `embeddings/ligands_v3/`, `embeddings/manifest.json`: feature cache.
