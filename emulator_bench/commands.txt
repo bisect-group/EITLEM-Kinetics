@@ -1,0 +1,14 @@
+# Run from the EITLEM-Kinetics submodule root with the mldb environment (see run.sh for the whole chain).
+PY=python  # we used the mldb conda env
+
+# Whole chain: cache, train (kcat and km, 42 runs), aggregate
+emulator_bench/run.sh
+
+# Steps one by one (same flags as run.sh)
+CUDA_VISIBLE_DEVICES=0 $PY emulator_bench/cache_embeddings.py --device cuda:0
+$PY emulator_bench/run_split_benchmarks.py --skip_cache --gpus 0 --runs_per_gpu 1 --num_workers 4 --seeds 666 777 888
+$PY emulator_bench/aggregate_eitlem_results.py
+
+
+# Print the commands without running them
+emulator_bench/run.sh --dry-run

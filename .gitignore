@@ -9,3 +9,4 @@
 *.sdf
 /Data/DLkcat/
 /notebook
+__pycache__/

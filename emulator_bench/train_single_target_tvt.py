@@ -1,0 +1,305 @@
+import argparse
+import datetime
+import os
+import random
+import sys
+import time
+from pathlib import Path
+
+# Batches live in a side-stream allocator pool; expandable segments stop it from fragmenting GPU memory.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import numpy as np
+import pandas as pd
+import torch
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from emulator_bench.common import (
+    EMULATOR_ROOT,
+    append_csv_row,
+    read_table,
+    regression_metrics,
+    require_columns,
+    resolve_amp_dtype,
+    save_json,
+    set_seed,
+)
+from emulator_bench.dataset import EitlemDataLoader
+from emulator_bench.feature_pipeline import LigandEmbeddingStore, ProteinEmbeddingStore
+from emulator_bench.modeling import build_model
+
+if str(EMULATOR_ROOT) not in sys.path:
+    sys.path.insert(0, str(EMULATOR_ROOT))
+from src.utils.rich_progress import progress
+
+
+def evaluate_loader(model, loader, device, amp_dtype=None, desc="Evaluation", show_progress=True):
+    model.eval()
+    preds, truths = [], []
+    total_loss = 0.0
+    total_samples = 0
+    loss_fn = torch.nn.MSELoss()
+    iterator = progress(loader, desc=desc, unit="batch", leave=False) if show_progress else loader
+    with torch.no_grad():
+        for batch in iterator:
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+                prediction = model(batch)
+            prediction = prediction.float()
+            total_loss += float(loss_fn(prediction, batch.value).item()) * int(batch.num_graphs)
+            total_samples += int(batch.num_graphs)
+            preds.append(prediction.detach().cpu().float())
+            truths.append(batch.value.detach().cpu().float())
+    truth_np = torch.cat(truths).numpy()
+    pred_np = torch.cat(preds).numpy()
+    metrics = regression_metrics(truth_np, pred_np)
+    metrics["loss"] = total_loss / max(1, total_samples)
+    return truth_np, pred_np, metrics
+
+
+def train_one_epoch(model, loader, optimizer, device, amp_dtype=None, scaler=None, desc="Train"):
+    model.train()
+    loss_fn = torch.nn.MSELoss()
+    total_loss = 0.0
+    total_samples = 0
+    for batch in progress(loader, desc=desc, unit="batch", leave=False):
+        optimizer.zero_grad()
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+            prediction = model(batch)
+        loss = loss_fn(prediction.float(), batch.value)
+        if scaler is None:
+            loss.backward()
+            optimizer.step()
+        else:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        total_loss += float(loss.item()) * int(batch.num_graphs)
+        total_samples += int(batch.num_graphs)
+    return total_loss / max(1, total_samples)
+
+
+RESUME_KEYS = (
+    "task_name",
+    "train_path",
+    "val_path",
+    "test_path",
+    "seed",
+    "epochs",
+    "batch_size",
+    "lr",
+    "amp",
+    "predictor_type",
+    "mol_type",
+    "radius",
+    "nbits",
+)
+
+
+def rng_state() -> dict:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def set_rng_state(state: dict) -> None:
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if state["cuda"] is not None:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def save_checkpoint(path: Path, **state) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(state, tmp)
+    os.replace(tmp, path)
+
+
+def fit(args, model, optimizer, scheduler, scaler, loaders, device, amp_dtype, out_dir: Path, resume: bool = True):
+    """Trains `args.epochs` epochs and writes `checkpoint.pth` after each one.
+
+    The checkpoint holds every state that affects later epochs. The shuffle order comes from the global
+    torch RNG (`RandomSampler` draws its seed from it), so the RNG state covers it. Resuming
+    restores the checkpointed state and `logfile.csv` rows, so the result equals an uninterrupted run.
+    """
+    checkpoint_path, logfile = out_dir / "checkpoint.pth", out_dir / "logfile.csv"
+    key_args = {key: getattr(args, key) for key in RESUME_KEYS}
+    rows, start_epoch, elapsed_before = [], 1, 0.0
+    if resume and checkpoint_path.exists():
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        changed = {key: (checkpoint["key_args"][key], value) for key, value in key_args.items() if checkpoint["key_args"][key] != value}
+        if changed:
+            raise SystemExit(f"Cannot resume {checkpoint_path}: arguments differ (checkpoint, now): {changed}. Use --no_resume to start fresh.")
+        model.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        scheduler.load_state_dict(checkpoint["scheduler"])
+        if scaler is not None:
+            scaler.load_state_dict(checkpoint["scaler"])
+        set_rng_state(checkpoint["rng"])
+        for name in ("train", "val"):  # the first pass of each loader already drew its base seed
+            loaders[name].seeded = True
+        rows, start_epoch, elapsed_before = checkpoint["rows"], checkpoint["epoch"] + 1, checkpoint["elapsed_seconds"]
+        print(f"Resuming from epoch {checkpoint['epoch']}", flush=True)
+    else:
+        checkpoint_path.unlink(missing_ok=True)
+    logfile.unlink(missing_ok=True)
+    for row in rows:
+        append_csv_row(logfile, row)
+
+    started = time.time()
+    for epoch in progress(range(start_epoch, args.epochs + 1), desc="Training", unit="epoch"):
+        row = {"epoch": epoch, "lr": optimizer.param_groups[0]["lr"]}
+        row["train_loss"] = train_one_epoch(model, loaders["train"], optimizer, device, amp_dtype, scaler, desc=f"Epoch {epoch} train")
+        _, _, val_metrics = evaluate_loader(model, loaders["val"], device, amp_dtype, show_progress=False)
+        row.update({f"val_{key}": value for key, value in val_metrics.items()})
+        row["elapsed_seconds"] = elapsed_before + time.time() - started
+        scheduler.step()
+        rows.append(row)
+        append_csv_row(logfile, row)
+        save_checkpoint(
+            checkpoint_path,
+            key_args=key_args,
+            epoch=epoch,
+            model=model.state_dict(),
+            optimizer=optimizer.state_dict(),
+            scheduler=scheduler.state_dict(),
+            scaler=None if scaler is None else scaler.state_dict(),
+            rng=rng_state(),
+            rows=rows,
+            elapsed_seconds=row["elapsed_seconds"],
+        )
+
+
+def save_predictions(path: Path, y_true: np.ndarray, y_pred: np.ndarray) -> None:
+    pd.DataFrame({"y_true": y_true, "y_pred": y_pred}).to_csv(path, index=False)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train EITLEM-Kinetics with its original settings on explicit train/val/test files.")
+    parser.add_argument("--train_path", type=str, required=True)
+    parser.add_argument("--val_path", type=str, required=True)
+    parser.add_argument("--test_path", type=str, required=True)
+    parser.add_argument("--embeddings_dir", type=str, required=True)
+    parser.add_argument("--out_dir", type=str, required=True)
+    parser.add_argument("--task_name", type=str, default="eitlem")
+    parser.add_argument("--predictor_type", choices=["kcat", "km"], required=True)
+    parser.add_argument("--mol_type", choices=["MACCSKeys", "ECFP", "RDKIT"], default="MACCSKeys")
+    parser.add_argument("--radius", type=int, default=4)
+    parser.add_argument("--nbits", type=int, default=1024)
+    parser.add_argument("--sequence_col", type=str, default="sequence")
+    parser.add_argument("--smiles_col", type=str, default="smiles")
+    parser.add_argument("--target_col", type=str, default="log10_value")
+
+    # Original settings: Code/iter_train_scripts.py (kineticsTrainer, no pre-trained weights).
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=200)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--seed", type=int, default=666)
+
+    parser.add_argument("--no_resume", action="store_true", help="Ignore checkpoint.pth and start from epoch 1.")
+    parser.add_argument(
+        "--amp", action="store_true", help="Mixed precision: bf16 on Ampere or newer, fp16 on older GPUs. Default is the original fp32."
+    )
+    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--num_workers", type=int, default=8, help="Threads that build batches.")
+    parser.add_argument("--prefetch_factor", type=int, default=2, help="Batches built ahead. Each one holds GPU memory.")
+    args = parser.parse_args()
+
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    set_seed(args.seed)
+    device = torch.device(args.device)
+    amp_dtype, precision_mode = resolve_amp_dtype(device) if args.amp else (None, "fp32")
+    scaler = torch.amp.GradScaler("cuda") if amp_dtype == torch.float16 else None
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths = {name: Path(getattr(args, f"{name}_path")) for name in ("train", "val", "test")}
+    frames = {name: read_table(path) for name, path in paths.items()}
+    for name, frame in frames.items():
+        require_columns(frame, [args.sequence_col, args.smiles_col, args.target_col], paths[name])
+    all_frame = pd.concat(frames.values(), ignore_index=True)
+
+    protein_store = ProteinEmbeddingStore(Path(args.embeddings_dir))
+    ligand_store = LigandEmbeddingStore(
+        Path(args.embeddings_dir),
+        mol_type=args.mol_type,
+        radius=args.radius,
+        nbits=args.nbits,
+        smiles_values=all_frame[args.smiles_col].astype(str).tolist(),
+    )
+    loaders = {
+        name: EitlemDataLoader(
+            frame,
+            protein_store,
+            ligand_store,
+            device,
+            args.batch_size,
+            shuffle=(name == "train"),
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            sequence_col=args.sequence_col,
+            smiles_col=args.smiles_col,
+            target_col=args.target_col,
+        )
+        for name, frame in frames.items()
+    }
+
+    model = build_model(
+        predictor_type=args.predictor_type,
+        mol_type=args.mol_type,
+        nbits=args.nbits,
+        hidden_dim=512,
+        protein_dim=1280,
+        layer=10,
+        dropout=0.5,
+        att_layer=10,
+    ).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[50, 80], gamma=0.9)
+
+    started_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    started = time.time()
+    print(f"Device: {device} | precision: {precision_mode}", flush=True)
+
+    fit(args, model, optimizer, scheduler, scaler, loaders, device, amp_dtype, out_dir, resume=not args.no_resume)
+
+    # The original code keeps only the weights of the last epoch.
+    torch.save({"model_state_dict": model.state_dict(), "epoch": args.epochs, "args": vars(args)}, out_dir / "lastmodel.pth")
+
+    final_metrics = {}
+    for name in ("train", "val", "test"):
+        y_true, y_pred, metrics = evaluate_loader(model, loaders[name], device, amp_dtype, desc=f"Final {name}")
+        save_predictions(out_dir / f"pred_label_{name}.csv", y_true, y_pred)
+        pd.DataFrame([metrics]).to_csv(out_dir / f"final_results_{name}.csv", index=False)
+        final_metrics[name] = metrics
+
+    save_json(
+        out_dir / "run_summary.json",
+        {
+            "task_name": args.task_name,
+            "started_at": started_at,
+            "finished_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "elapsed_seconds": time.time() - started,
+            "precision_mode": precision_mode,
+            "train_path": str(paths["train"]),
+            "val_path": str(paths["val"]),
+            "test_path": str(paths["test"]),
+            "final_train_metrics": final_metrics["train"],
+            "final_val_metrics": final_metrics["val"],
+            "final_test_metrics": final_metrics["test"],
+            "args": vars(args),
+        },
+    )
+    (out_dir / "checkpoint.pth").unlink(missing_ok=True)  # last, so a kill during the final evaluation resumes at the last epoch
+
+
+if __name__ == "__main__":
+    main()
